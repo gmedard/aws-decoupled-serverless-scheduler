@@ -1,0 +1,986 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Decoupled Serverless Scheduler To Run HPC Applications At Scale on EC2 -
+  Serverless Scheduler (uksb-1q7ff025u)
+Parameters:
+  TimeoutJob:
+    Default: 5
+    Type: String
+    Description: >-
+      This is the interval (in seconds) to poll SSM for job status where 5s is
+      resonable. If jobs run an hour or more then polling every 60 seconds might
+      be better.
+
+Resources:
+  DeployStateMachine:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      RoleArn: !GetAtt
+        - StateMachineExecutionRole
+        - Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "The scheduler state machine has a 1to1 mapping with an EC2 instance and runs jobs from SQS queue on instance using SSM run commands on windows EC2 then shut down instance",
+          "StartAt": "WaitEC2",
+          "States": {
+            "WaitEC2": {
+              "Type": "Task",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 3,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "FinalTerminate"
+                }
+              ],
+              "InputPath": "$",
+              "Resource": "${WaitEC2.Arn}",
+              "Next": "SetProtect",
+              "ResultPath": "$.ec2start"
+            },
+            "SetProtect": {
+              "Type": "Pass",
+              "Result": "True",
+              "ResultPath": "$.protect",
+              "Next": "ProtectEC2"
+            },
+            "ProtectEC2": {
+              "Type": "Task",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 3,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "YesNoProtected"
+                }
+              ],
+              "Resource": "${ProtectEC2.Arn}",
+              "InputPath": "$",
+              "ResultPath": "$.ProtectEC2",
+              "Next": "YesNoProtected"
+            },
+            "YesNoProtected": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.ProtectEC2",
+                  "StringEquals": "200",
+                  "Next": "GetJob"
+                },
+                {
+                  "Variable": "$.input.autoscaling_group",
+                  "StringEquals": "nothing",
+                  "Next": "GetJob"
+                }
+              ],
+              "Default": "SetUnProtect"
+            },
+            "GetJob": {
+              "Type": "Task",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "SQSCheck"
+                }
+              ],
+              "Resource": "${GetJob.Arn}",
+              "InputPath": "$",
+              "ResultPath": "$.raw_message",
+              "Next": "DeleteJob"
+            },
+            "DeleteJob": {
+              "Type": "Task",
+              "Retry" : [{
+                "ErrorEquals": [ "States.ALL" ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+                }],
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.error-info",
+                "Next": "ExtractJob"
+                }],
+              "Resource": "${DeleteJob.Arn}",
+              "InputPath": "$",
+              "ResultPath": "$.delete_message",
+              "Next": "ExtractJob"
+            },
+            "ExtractJob": {
+              "Type": "Task",
+              "Retry" : [{
+                "ErrorEquals": [ "States.ALL" ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+                }],
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.error-info",
+                "Next": "FailedJob"
+                }],
+              "Resource": "${ExtractJob.Arn}",
+              "InputPath": "$.raw_message",
+              "ResultPath": "$.job_details",
+              "Next": "StartJob"
+            },
+            "StartJob": {
+              "Type": "Task",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "StatusFailed"
+                }
+              ],
+              "Resource": "${StartJob.Arn}",
+              "InputPath": "$",
+              "Next": "StatusStarted",
+              "ResultPath": "$.CommandId"
+            },
+            "StatusStarted": {
+              "Type": "Pass",
+              "Result": "Started",
+              "ResultPath": "$.status",
+              "Next": "WriteJobStart"
+            },
+            "WriteJobStart": {
+              "Type": "Task",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "Wait"
+                }
+              ],
+              "Resource": "${DynamoDB.Arn}",
+              "InputPath": "$",
+              "Next": "Wait",
+              "ResultPath": "$.DynamoDB"
+            },
+            "Wait": {
+              "Type": "Wait",
+              "InputPath": "$",
+              "SecondsPath": "$.input.Timeout_Job",
+              "Next": "CheckJob"
+            },
+            "CheckJob": {
+              "Type": "Task",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 3,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "YesNoJobRunning"
+                }
+              ],
+              "Resource": "${CheckJob.Arn}",
+              "InputPath": "$",
+              "Next": "YesNoJobRunning",
+              "ResultPath": "$.jobstatus"
+            },
+            "YesNoJobRunning": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.jobstatus[0]",
+                  "StringEquals": "pending",
+                  "Next": "Wait"
+                },
+                {
+                  "Variable": "$.jobstatus[0]",
+                  "StringEquals": "failed",
+                  "Next": "StatusFailed"
+                },
+                {
+                  "Variable": "$.jobstatus[0]",
+                  "StringEquals": "success",
+                  "Next": "ConfirmResult"
+                }
+              ],
+              "Default": "Wait"
+            },
+            "ConfirmResult": {
+              "Type": "Task",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 3,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "StatusFailed"
+                }
+              ],
+              "Resource": "${ConfirmResult.Arn}",
+              "InputPath": "$",
+              "ResultPath": "$.ConfirmResultFile",
+              "Next": "YesNoResultFile"
+            },
+            "YesNoResultFile": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.ConfirmResultFile",
+                  "StringEquals": "success",
+                  "Next": "StatusSuccessful"
+                },
+                {
+                  "Variable": "$.ConfirmResultFile",
+                  "StringEquals": "fail",
+                  "Next": "StatusFailed"
+                }
+              ],
+              "Default": "ConfirmResult"
+            },
+            "StatusFailed": {
+              "Type": "Pass",
+              "Result": "Failed",
+              "ResultPath": "$.status",
+              "Next": "WriteJobFailed"
+            },
+            "StatusSuccessful": {
+              "Type": "Pass",
+              "Result": "Successful",
+              "ResultPath": "$.status",
+              "Next": "WriteJobSuccessful"
+            },
+            "WriteJobSuccessful": {
+              "Type": "Task",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "SQSOut"
+                }
+              ],
+              "Resource": "${DynamoDB.Arn}",
+              "InputPath": "$",
+              "Next": "SQSOut",
+              "ResultPath": "$.DynamoDB"
+            },
+            "WriteJobFailed": {
+              "Type": "Task",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "AddSQS"
+                }
+              ],
+              "Resource": "${DynamoDB.Arn}",
+              "InputPath": "$",
+              "Next": "AddSQS",
+              "ResultPath": "$.DynamoDB"
+            },
+            "AddSQS": {
+              "Type": "Task",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 3,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "FailedJob"
+                }
+              ],
+              "Resource": "${AddSQS.Arn}",
+              "InputPath": "$",
+              "ResultPath": "$.message",
+              "Next": "YesNoRetryFinished"
+            },
+            "YesNoRetryFinished": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.message",
+                  "StringEquals": "NoRetries",
+                  "Next": "FailedJob"
+                }
+              ],
+              "Default": "SQSCheck"
+            },
+            "SQSOut": {
+              "Type": "Task",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 3,
+                  "MaxAttempts": 5,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "FailedJob"
+                }
+              ],
+              "Resource": "${SQSOut.Arn}",
+              "InputPath": "$",
+              "ResultPath": "$.message",
+              "Next": "SQSCheck"
+            },
+            "FailedJob": {
+              "Type": "Task",
+              "Retry" : [{
+                "ErrorEquals": [ "States.ALL" ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+                }],
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.error-info",
+                "Next": "SQSFail"
+                }],
+              "Resource": "${FailedJob.Arn}",
+              "InputPath": "$",
+              "ResultPath": "$.message",
+              "Next": "SQSCheck"
+            },
+            "SQSCheck": {
+              "Type": "Task",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 7,
+                  "MaxAttempts": 5,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "SetUnProtect"
+                }
+              ],
+              "Resource": "${SQSCheck.Arn}",
+              "InputPath": "$",
+              "Next": "YesNoSQSEmpty",
+              "ResultPath": "$.SQSstatus"
+            },
+            "YesNoSQSEmpty": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.SQSstatus",
+                  "StringEquals": "Zero",
+                  "Next": "SetUnProtect"
+                },
+                {
+                  "Variable": "$.SQSstatus",
+                  "StringEquals": "NotZero",
+                  "Next": "PassCleanEntry"
+                }
+              ],
+              "Default": "SQSCheck"
+            },
+            "PassCleanEntry": {
+              "Type": "Pass",
+              "Parameters": {
+                "input.$" : "$.input",
+                "ec2start.$" : "$.ec2start",
+                "protect.$" : "$.protect",
+                "ProtectEC2.$" : "$.ProtectEC2"
+              },
+              "Next": "GetJob"
+            },
+            "SetUnProtect": {
+              "Type": "Pass",
+              "Result": "False",
+              "ResultPath": "$.protect",
+              "Next": "UnProtectEC2"
+            },
+            "UnProtectEC2": {
+              "Type": "Task",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 5,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "FinalTerminate"
+                }
+              ],
+              "Resource": "${ProtectEC2.Arn}",
+              "InputPath": "$",
+              "ResultPath": "$.ProtectEC2",
+              "Next": "FinalTerminate"
+            },
+            "FinalTerminate": {
+              "Type": "Task",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 5,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "ClientError",
+                    "TypeError"
+                  ],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "Finish"
+                }
+              ],
+              "Resource": "${FinalTerminate.Arn}",
+              "InputPath": "$",
+              "ResultPath": "$.finalterminate",
+              "Next": "Finish"
+            },
+            "Finish": {
+              "Type": "Succeed"
+            },
+            "SQSFail": {
+              "Type": "Fail",
+              "Cause": "SQSAdd did not put job back on queue",
+              "Error": "Error in AddSQS"
+            }
+          }
+        }
+  AddSQS:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: solution-builders-us-east-2
+        S3Key: decoupled-serverless-scheduler/v8/75f45d78758b73418246b17560264f7f
+      Tags:
+        - Value: SAM
+          Key: 'lambda:createdBy'
+      MemorySize: 512
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaRole
+        - Arn
+      Timeout: 420
+      Runtime: python3.6
+  StartJob:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: solution-builders-us-east-2
+        S3Key: decoupled-serverless-scheduler/v8/0d02292c19c953f2171550d08e700f86
+      Tags:
+        - Value: SAM
+          Key: 'lambda:createdBy'
+      MemorySize: 512
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaRole
+        - Arn
+      Timeout: 420
+      Runtime: python3.6
+  StateMachineExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action: 'lambda:InvokeFunction'
+                Resource:
+                  - !GetAtt AddSQS.Arn
+                  - !GetAtt DeleteJob.Arn
+                  - !GetAtt ExtractJob.Arn
+                  - !GetAtt FailedJob.Arn
+                  - !GetAtt WaitEC2.Arn
+                  - !GetAtt SQSOut.Arn
+                  - !GetAtt GetJob.Arn
+                  - !GetAtt ConfirmResult.Arn
+                  - !GetAtt StartJob.Arn
+                  - !GetAtt CheckJob.Arn
+                  - !GetAtt SQSCheck.Arn
+                  - !GetAtt ProtectEC2.Arn
+                  - !GetAtt DynamoDB.Arn
+                  - !GetAtt FinalTerminate.Arn
+                Effect: Allow
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: !Sub 'states.${AWS::Region}.amazonaws.com'
+  DeleteJob:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: solution-builders-us-east-2
+        S3Key: decoupled-serverless-scheduler/v8/26263dac1b6c24a458480524fd535190
+      Tags:
+        - Value: SAM
+          Key: 'lambda:createdBy'
+      MemorySize: 512
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaRole
+        - Arn
+      Timeout: 420
+      Runtime: python3.6
+  EventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      EventPattern:
+        source:
+          - aws.ec2
+        detail:
+          state:
+            - pending
+        detail-type:
+          - EC2 Instance State-change Notification
+      Description: EventRule
+      State: ENABLED
+      Targets:
+        - Id: TargetFunctionV1
+          Arn: !GetAtt
+            - TriggerStepFunction
+            - Arn
+  SQSCheck:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: solution-builders-us-east-2
+        S3Key: decoupled-serverless-scheduler/v8/6462cfab20d52a5f5872597608413328
+      Tags:
+        - Value: SAM
+          Key: 'lambda:createdBy'
+      MemorySize: 512
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaRole
+        - Arn
+      Timeout: 420
+      Runtime: python3.6
+  FailedJob:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: solution-builders-us-east-2
+        S3Key: decoupled-serverless-scheduler/v8/4646ac913cef1d6365ac108fe2352bdc
+      Tags:
+        - Value: SAM
+          Key: 'lambda:createdBy'
+      MemorySize: 512
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaRole
+        - Arn
+      Timeout: 420
+      Runtime: python3.6
+  LambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/AmazonEC2FullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonSQSFullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonSSMFullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonSNSFullAccess'
+        - 'arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+  CheckJob:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: solution-builders-us-east-2
+        S3Key: decoupled-serverless-scheduler/v8/32b70c2626a649f15c0ffee2f214b20a
+      Tags:
+        - Value: SAM
+          Key: 'lambda:createdBy'
+      MemorySize: 512
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaRole
+        - Arn
+      Timeout: 420
+      Runtime: python3.6
+  FinalTerminate:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: solution-builders-us-east-2
+        S3Key: decoupled-serverless-scheduler/v8/6dd806b9f4667a6f856e26604cba16f9
+      Tags:
+        - Value: SAM
+          Key: 'lambda:createdBy'
+      MemorySize: 512
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaRole
+        - Arn
+      Timeout: 420
+      Runtime: python3.6
+  ProtectEC2:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: solution-builders-us-east-2
+        S3Key: decoupled-serverless-scheduler/v8/bddb85d3b1c5c4a272d2e0f5a21e4cf4
+      Tags:
+        - Value: SAM
+          Key: 'lambda:createdBy'
+      MemorySize: 512
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaRole
+        - Arn
+      Timeout: 420
+      Runtime: python3.6
+  JobOutputSQS:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-job-queue-finished'
+  DynamoTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+      Tags:
+        - Value: !Sub '${AWS::StackName}'
+          Key: Scheduler
+      ProvisionedThroughput:
+        WriteCapacityUnits: 10
+        ReadCapacityUnits: 10
+      TableName: !Sub '${AWS::StackName}-job-monitoring'
+      KeySchema:
+        - KeyType: HASH
+          AttributeName: job_id
+      SSESpecification:
+        SSEEnabled: false
+  DynamoDB:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: solution-builders-us-east-2
+        S3Key: decoupled-serverless-scheduler/v8/7b3d58c4ace4cc88b1bd1d3c9662a2fd
+      Tags:
+        - Value: SAM
+          Key: 'lambda:createdBy'
+      MemorySize: 512
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaRole
+        - Arn
+      Timeout: 420
+      Runtime: python3.6
+  TriggerStepFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: solution-builders-us-east-2
+        S3Key: decoupled-serverless-scheduler/v8/096f014d87062fe741ef41646760732d
+      Tags:
+        - Value: SAM
+          Key: 'lambda:createdBy'
+      MemorySize: 512
+      Environment:
+        Variables:
+          TAGKEY: !Sub '${AWS::StackName}'
+          SQSOUTPUTNAME: !Sub '${AWS::StackName}-job-queue-finished'
+          STATEMACHINEARN: !Ref DeployStateMachine
+          REGION: !Ref 'AWS::Region'
+          TABLENAME: !Sub '${AWS::StackName}-job-monitoring'
+          STATEMACHINENAME: !GetAtt
+            - DeployStateMachine
+            - Name
+          SQSINPUTNAME: !Sub '${AWS::StackName}-job-queue'
+          TIMEOUTJOB: !Ref TimeoutJob
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaRole
+        - Arn
+      Timeout: 420
+      Runtime: python3.6
+  PermissionForEventsToInvokeLambda:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref TriggerStepFunction
+      SourceArn: !GetAtt
+        - EventRule
+        - Arn
+      Principal: events.amazonaws.com
+  WorkerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ssm-access-role'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM'
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+  SQSOut:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: solution-builders-us-east-2
+        S3Key: decoupled-serverless-scheduler/v8/0e0bf66f5146f3973abdee282334a2ee
+      Tags:
+        - Value: SAM
+          Key: 'lambda:createdBy'
+      MemorySize: 512
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaRole
+        - Arn
+      Timeout: 420
+      Runtime: python3.6
+  WaitEC2:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: solution-builders-us-east-2
+        S3Key: decoupled-serverless-scheduler/v8/7d4f720f79dc93bf0e717abbb299e159
+      Tags:
+        - Value: SAM
+          Key: 'lambda:createdBy'
+      MemorySize: 512
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaRole
+        - Arn
+      Timeout: 420
+      Runtime: python3.6
+  ExtractJob:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: solution-builders-us-east-2
+        S3Key: decoupled-serverless-scheduler/v8/55bc69df874c1344a37cd62986d51b59
+      Tags:
+        - Value: SAM
+          Key: 'lambda:createdBy'
+      MemorySize: 512
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaRole
+        - Arn
+      Timeout: 420
+      Runtime: python3.6
+  GetJob:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: solution-builders-us-east-2
+        S3Key: decoupled-serverless-scheduler/v8/1f9b4260d275e105232c5870906be5df
+      Tags:
+        - Value: SAM
+          Key: 'lambda:createdBy'
+      MemorySize: 512
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaRole
+        - Arn
+      Timeout: 420
+      Runtime: python3.6
+  JobFailedSQS:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-job-queue-failed'
+  ConfirmResult:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: solution-builders-us-east-2
+        S3Key: decoupled-serverless-scheduler/v8/83fcbb52f768e1c3bc3840266c095758
+      Tags:
+        - Value: SAM
+          Key: 'lambda:createdBy'
+      MemorySize: 512
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaRole
+        - Arn
+      Timeout: 420
+      Runtime: python3.6
+  JobInputSQS:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-job-queue'
+Outputs:
+  TagKey:
+    Description: >-
+      EC2 TAG KEY - The tag key you will need to use to associate an EC2
+      instance with this serverless scheduler, to avoid duplication stack name
+      is used
+    Value: !Sub '${AWS::StackName}'
+  SQSInputQueue:
+    Description: >-
+      The name of the default queue to submit jobs to and needed as EC2 tag
+      value if using default queue.
+    Value: !Sub '${AWS::StackName}-job-queue'
+  IAMRoleForEC2Workers:
+    Description: >-
+      This IAM role needs to be used for EC2 Workers for SSM to send jobs, add
+      more policies to access other servcies from EC2 such as S3, EFS, or FSx
+    Value: !Ref WorkerRole
+  SQSFailedQueue:
+    Description: SQS default queue where failed jobs land
+    Value: !Ref JobFailedSQS
+  SQSFinishedQueue:
+    Description: SQS default queue where succesful jobs land
+    Value: !Ref JobOutputSQS
+  DynamoDBTable:
+    Description: DynamoDB table where you can monitor jobs
+    Value: !Ref DynamoTable
+
